@@ -69,6 +69,16 @@ type Config struct {
 		// 拒这条请求」时它是唯一能对上的证据，但那该是运维主动开的临时手段，
 		// 不是默认行为。热生效，无需重启。
 		RequestArchiveContext bool `json:"request_archive_context"`
+		// PanelLogEnabled 面板「运行日志」是否按天落盘，缺省 true。
+		//
+		// 为什么默认开：内存环每频道只有 500 条，一次长会话就能把上午的行冲掉，
+		// 重启更是全部归零——「昨天下午那波 429 从几点开始的」这类问题原本无解。
+		// 落盘是纯增量文本（一天几 MB），代价远小于丢失事故现场。
+		PanelLogEnabled bool `json:"panel_log_enabled"`
+		// PanelLogRetentionDays 面板日志保留天数，缺省 7；<=0 回落默认。
+		PanelLogRetentionDays int `json:"panel_log_retention_days"`
+		// PanelLogMaxMB 面板日志总量上限（MiB，按天文件，单文件超限轮转），缺省 50。
+		PanelLogMaxMB int `json:"panel_log_max_mb"`
 	} `json:"logging"`
 
 	Server struct {
@@ -82,6 +92,12 @@ type Config struct {
 		// 时限）。长流式 SSE 合法时长可达分钟级，固定 5s 必然把在途请求掐成
 		// 连接重置。缺省 "30s"；"0" = 不等待直接退。改动需重启进程。
 		ShutdownTimeout string `json:"shutdown_timeout"`
+		// MaxPayloadBytes 入站请求体安全上限（字节），缺省 67108864（64 MiB）。
+		// 这不是「大请求预拦截」：旧的 8 MB 紧上限因为多图/长会话被移除过（大请求
+		// 交上游自然响应）。这里只挡「大到能把进程读死」的上传——读体是 io.ReadAll
+		// 无界的，一次几百 MB 的 body 就能把网关 OOM 掉。允许范围 8–512 MiB；
+		// 改动需重启进程。超限回 413（OpenAI 形状 / Anthropic 形状各自适配）。
+		MaxPayloadBytes int64 `json:"max_payload_bytes"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -179,6 +195,15 @@ type Config struct {
 		// 「无卡/无断点/数据异常一律跳过，绝不瞎补」）。这里默认不动既有行为，
 		// 想保守的部署把它设成 1 即可——两轮之间还有次日签到，急不来。
 		MakeupCardsPerRound int `json:"makeup_cards_per_round"` // 缺省 0（不限）；>0 = 每轮上限
+
+		// 额度窗口探针（pool/window.go + scheduler/windowprobe.go）：上游 429 带
+		// 「将在 … 重置」时登记窗口，到点主动发一个最小请求，把新一轮额度窗口的
+		// 计时起点钉在重置那一刻。
+		//
+		// 为什么需要：上游按**首次请求**起算窗口。重置时刻到了却没人发请求，窗口就
+		// 不开始，额度一直空转；等下一条真实请求进来，起点落到那一刻，中间那段额度
+		// 白扔。关闭后行为回到「只解除冷却、不主动起窗」。
+		WindowProbeEnabled bool `json:"window_probe_enabled"` // 缺省 true；false = 关闭
 	} `json:"schedule"`
 
 	Global struct {
@@ -253,6 +278,12 @@ type Config struct {
 		// 长会话把 tools 定义排在几百条 messages 之后，256 KB 常在中途截断，
 		// 排障时看不到工具声明（issue #44 的反馈）。0 = 用默认值。
 		DumpMaxBytes int `json:"dump_max_bytes"`
+		// RestrictionHoldSeconds 11140 风控连坐的全池暂停时长（秒），缺省 1800。
+		// 上游把「账号存在异常行为」判在设备/出口上：一个请求顺着换号打下去会把
+		// 一串账号送进风控。命中 11140 网关一律就地停手（不换号）；同一 15 分钟窗
+		// 内出现 2 个不同账号被限制时，再全池暂停这么久（期间 503 + Retry-After）。
+		// 0 = 关掉全池暂停，只保留「命中即停手」。改动需重启进程。
+		RestrictionHoldSeconds int `json:"restriction_hold_seconds"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -357,11 +388,20 @@ type Config struct {
 		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114）：ErrClient/传输层这类「不罚号」失败连续计数，达阈
 		// 临时出池。与冷却/熔断并存取更长者不叠加。默认 5 次 / 10m。
-		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
-		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
-		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
-		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
-		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+		// SelectionStrategy 选号策略（pool 包 strategy.go）：weighted（缺省，加权随机）/
+		// round_robin（轮询，每次请求换下一个）/ sequential（顺序耗尽，当前号用到不可用
+		// 才换）。空或未知值 = weighted。
+		//
+		// 三条策略都只在**已过全部可用性判定**的候选里决定「选哪个」：健康、冷却、
+		// 在途上限、积分保底、成本分层、账号优先级全部先于它生效。所以切到
+		// sequential 也烧不穿 credit_floor——这是有意的边界，不是实现疏忽。
+		// 热生效（面板保存配置即换），无需重启。
+		SelectionStrategy string  `json:"selection_strategy"`
+		IdleWeightPerHour float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
+		IdleWeightMax     float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
 		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
@@ -507,11 +547,16 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Server.ShutdownTimeout = "30s"
+	c.Server.MaxPayloadBytes = 64 << 20
+	c.Upstream.RestrictionHoldSeconds = 1800
 	c.Panel.PackageDetailLimit = 5
 	c.Update.AutoTime = "04:00"
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
+	c.Logging.PanelLogEnabled = true
+	c.Logging.PanelLogRetentionDays = 7
+	c.Logging.PanelLogMaxMB = 50
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	c.Logging.RequestClientInfo = true
@@ -533,6 +578,7 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	c.Schedule.WindowProbeEnabled = true
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -546,7 +592,7 @@ func Default() *Config {
 	// 思考档位策略缺省：网关按模型最高档补缺档请求，但客户端显式档位优先
 	// （client_priority=true），且不覆盖客户端的关闭思考意图（override_scope=level）。
 	c.Thinking.Enabled = true
-	c.Thinking.DefaultEffort = "max"
+	c.Thinking.DefaultEffort = upstream.DefaultGatewayEffort
 	c.Thinking.ClientPriority = true
 	c.Thinking.OverrideScope = "level"
 	c.Pool.MaxInFlight = 3
@@ -924,6 +970,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
+		c.Logging.PanelLogEnabled = true
+		c.Logging.PanelLogRetentionDays = 7
+		c.Logging.PanelLogMaxMB = 50
 	}
 	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
 	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
@@ -946,6 +995,18 @@ func (c *Config) normalize() error {
 	}
 	if c.ShutdownTimeoutDur < 0 {
 		return fmt.Errorf("server.shutdown_timeout: 负时长 %q 无意义", c.Server.ShutdownTimeout)
+	}
+	// 请求体安全上限（OOM 护栏，不是预拦截）：0 = 用默认；越界直接报错——静默钳
+	// 会让护栏悄悄换成另一个数，运维以为配上了其实没配上。
+	if c.Server.MaxPayloadBytes == 0 {
+		c.Server.MaxPayloadBytes = 64 << 20
+	}
+	if c.Server.MaxPayloadBytes < 8<<20 || c.Server.MaxPayloadBytes > 512<<20 {
+		return fmt.Errorf("server.max_payload_bytes: %d 超出允许范围 8–512 MiB", c.Server.MaxPayloadBytes)
+	}
+	// 11140 连坐暂停时长：0 = 关闭（只保留命中即停手），负值无意义。
+	if c.Upstream.RestrictionHoldSeconds < 0 {
+		return fmt.Errorf("upstream.restriction_hold_seconds: 负值 %d 无意义（0 = 关闭）", c.Upstream.RestrictionHoldSeconds)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
@@ -1207,7 +1268,7 @@ func (c *Config) normalize() error {
 func (c *Config) normalizeThinking() error {
 	c.Thinking.DefaultEffort = strings.ToLower(strings.TrimSpace(c.Thinking.DefaultEffort))
 	if c.Thinking.DefaultEffort == "" {
-		c.Thinking.DefaultEffort = "max"
+		c.Thinking.DefaultEffort = upstream.DefaultGatewayEffort
 	}
 	if c.Thinking.DefaultEffort == "off" || !upstream.IsEffortLevel(c.Thinking.DefaultEffort) {
 		return fmt.Errorf("thinking.default_effort: %q 不是合法档位（max 或 low/medium/high/xhigh 等）", c.Thinking.DefaultEffort)
