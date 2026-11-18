@@ -44,7 +44,33 @@ type Config struct {
 		AutoEnabled bool `json:"auto_enabled"`
 		// AutoTime 自动更新时间，格式 HH:MM（Asia/Shanghai）。
 		AutoTime string `json:"auto_time"`
+		// Proxy 更新走哪个出口（issue #198，可热生效）：空 = 不显式设置；
+		// 支持 http:// / https:// / socks5://。出站被墙、api.github.com 通而
+		// release-assets 不通时填这里（或 mirror）。
+		Proxy string `json:"proxy"`
+		// ProxyFromEnv 是否沿用进程环境变量里的 HTTP(S)_PROXY（默认 true）。
+		// 设为 false 时只看 proxy 字段——容器里环境变量被别处塞了值、但更新
+		// 需要走另一条通道时用。
+		ProxyFromEnv *bool `json:"proxy_from_env"`
+		// Mirror 资产下载镜像前缀（issue #198），例如 https://ghfast.top/。
+		// 只作用于**资产下载**：Release 元数据（tag/digest/size）永远直连
+		// api.github.com，校验口径不变，镜像无法投毒。空 = 直连。
+		Mirror string `json:"mirror"`
 	} `json:"update"`
+
+	Accounts struct {
+		// ReloadInterval 账号目录热重载轮询间隔（issue #199）。空 = 默认 10s；
+		// "0s" = 关闭轮询（手动接口 POST /panel/api/accounts/reload 仍然可用）。
+		//
+		// 为什么默认开启：外部脚本/另一台机器往 auths/ 同步文件是最常见用法，
+		// 而重启进程会丢在途请求。轮询只读 ReadDir + 少量解析，几十个号的目录
+		// 是微秒级开销。
+		ReloadInterval string `json:"reload_interval"`
+		// ReloadDeleteConfirm 文件消失后要连续几轮扫描确认才把账号移出池（默认 2）。
+		// 半写文件、临时移走文件都可能让账号「这一轮看不见」；剔除会写进 state.json，
+		// 下次启动也不复活，所以要连续确认。1 = 立即删（不建议）。
+		ReloadDeleteConfirm int `json:"reload_delete_confirm"`
+	} `json:"accounts"`
 
 	Logging struct {
 		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
@@ -92,6 +118,10 @@ type Config struct {
 		// 时限）。长流式 SSE 合法时长可达分钟级，固定 5s 必然把在途请求掐成
 		// 连接重置。缺省 "30s"；"0" = 不等待直接退。改动需重启进程。
 		ShutdownTimeout string `json:"shutdown_timeout"`
+		// HeadKeepalive 等上游首帧期间向客户端补 SSE 注释帧的间隔。
+		// 缺省 "1500ms"；"0" = 关闭（回到首帧否决窗口内零字节的旧行为）。
+		// 改动需重启进程。
+		HeadKeepalive string `json:"head_keepalive"`
 		// MaxPayloadBytes 入站请求体安全上限（字节），缺省 67108864（64 MiB）。
 		// 这不是「大请求预拦截」：旧的 8 MB 紧上限因为多图/长会话被移除过（大请求
 		// 交上游自然响应）。这里只挡「大到能把进程读死」的上传——读体是 io.ReadAll
@@ -232,7 +262,7 @@ type Config struct {
 		// 直接复位，CN 模型目录与对话全部 EOF；需要时用它填这个键回落。
 		ChatBase string `json:"chat_base"`
 		// BillingBase 国内 billing/growth 上游 base 覆盖；空 = 内置默认
-		// https://www.workbuddy.cn（2026-10-28 起对齐 WorkBuddy 5.9.3 客户端：
+		// https://www.workbuddy.cn（2026-10-28 起对齐 WorkBuddy 桌面端：
 		// 客户端把 CN 全部 billing/activity 都打到 workbuddy.cn）。
 		// 旧口径是 www.codebuddy.cn（CodeBuddy CLI 时代，按 CLI 指纹点亮任务用），
 		// 需要退回时填 "https://www.codebuddy.cn"。
@@ -257,9 +287,9 @@ type Config struct {
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
+		// X-IDE-Version）。空 = 内置默认（对齐官方 CN 5.11.3 / GL 5.9.4 分发包）。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（CN 包内置 CLI 2.176.0 / GL 2.165.0）。
 		CliVersion string `json:"cli_version"`
 		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。
@@ -289,6 +319,9 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// ProxyExitLookup 代理健康探测时经该代理查一次出口画像（国家 / 住宅或机房 / ISP，
+		// proxypool/intel.go），缺省 false，热生效。每个节点每 6 小时一次第三方请求（ip-api 免费档仅明文 HTTP）。
+		ProxyExitLookup bool `json:"proxy_exit_lookup"`
 		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，与上游既有行为一致）；
 		// "identity" = 仅 system/developer，其余角色按用户数据原样透传（features.sanitize_brand_scope）。
 		SanitizeBrandScope string `json:"sanitize_brand_scope"`
@@ -299,6 +332,12 @@ type Config struct {
 		// 「功能存在、只是没开」，不用去猜路径拼错）。
 		EmbeddingsEnabled bool `json:"embeddings_enabled"`
 
+		// BusyRetry 6020/6021 渠道排队时，先在网关内按上游 retry_after 等一轮再试一次，
+		// 避免把「等 40 秒就好」的排队当成不可重试错误甩给客户端（默认 true）。
+		BusyRetry bool `json:"busy_retry"`
+		// BusyWaitSeconds 单次排队等待上限（秒，默认 60）。0 = 用默认；负数 = 不等。
+		BusyWaitSeconds int `json:"busy_wait_seconds"`
+
 		// WatermarkStripEnabled 实验特性：水印裁切端点 POST /v1/images/strip-watermark
 		// 与 MCP 工具 strip_watermark 的总开关，默认 false。
 		//
@@ -308,6 +347,30 @@ type Config struct {
 		// 1%），所以不适合当默认行为。关闭时端点回 403 watermark_strip_disabled，
 		// MCP 工具不出现在 tools/list 里。面板保存后经 livecfg 热生效。
 		WatermarkStripEnabled bool `json:"watermark_strip_enabled"`
+
+		// ThreeDEnabled 混元 3D 生成（POST /v1/3d/* 与 MCP 工具 generate_3d /
+		// get_3d_task）的总开关，默认 false。
+		//
+		// 打开后凭证由 ThreeDAutoToken 自动签发（用账号自己的 access token 调官方
+		// /v2/api-keys 换 ck_t_，协议见 internal/upstream/three_d_credential.go），
+		// 不再需要手工收集凭证。关闭时端点回 403 three_d_disabled，
+		// MCP 工具不出现在 tools/list 里。
+		ThreeDEnabled bool `json:"three_d_enabled"`
+
+		// ThreeDTempTokens 手工配置的 `ck_t_` 临时云凭证，键 = 账号 UID，特殊键 "*"
+		// 作为兜底（不区分账号的凭证）。见 internal/upstream/three_d_credential.go。
+		//
+		// 敏感字段：只进内存，不写日志、不回显到面板、不进错误信息。作为自动签发的
+		// **手工覆盖**：填了的账号直接用这份凭证，不再签发；留空 = 全走自动签发。
+		ThreeDTempTokens map[string]string `json:"three_d_temp_tokens"`
+
+		// ThreeDAutoToken 自动签发临时云凭证（默认 true）：打开 3D 后网关用已登录
+		// 账号自己的 access token 调官方 /v2/api-keys 换 ck_t_（官方客户端
+		// connect_cloud_service 同款协议，2026-11-14 真机验证），按账号缓存到过期前，
+		// 上游 401/403 拒绝时自动重签。静态 API Key 账号（ck_/pt_ 前缀）没有 OAuth
+		// 身份签不出来，会自动跳过并回 503。显式 false 可退回「只用手工凭证表」。
+		// 改动需重启生效。
+		ThreeDAutoToken bool `json:"three_d_auto_token"`
 	} `json:"features"`
 
 	Models struct {
@@ -529,8 +592,12 @@ type Config struct {
 	BalanceWindowDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// HeadKeepaliveDur 解析后的首帧心跳间隔（缺省 1.5s，0 = 关闭）。
+	HeadKeepaliveDur time.Duration `json:"-"`
 	// ShutdownTimeoutDur 解析后的优雅关停窗口；0 = 不等待在途请求直接退。
 	ShutdownTimeoutDur time.Duration `json:"-"`
+	// ReloadIntervalDur 解析后的账号目录轮询间隔（issue #199）；0 = 关闭轮询。
+	ReloadIntervalDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -551,6 +618,9 @@ func Default() *Config {
 	c.Upstream.RestrictionHoldSeconds = 1800
 	c.Panel.PackageDetailLimit = 5
 	c.Update.AutoTime = "04:00"
+	// 账号目录热重载（issue #199）：默认 10s 轮询、连续 2 次确认才删。
+	c.Accounts.ReloadInterval = "10s"
+	c.Accounts.ReloadDeleteConfirm = 2
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
@@ -588,6 +658,13 @@ func Default() *Config {
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Features.SanitizeBrandScope = "all"
+	// 6020/6021 排队等待（见 internal/server/handler.go 的 ErrUpstreamBusy 分支）：
+	// 缺省等一轮（60s 上限），避免把上游明说「40 秒后再来」的排队秒变成客户端可见失败。
+	c.Features.BusyRetry = true
+	c.Features.BusyWaitSeconds = 60
+	// 3D 临时凭证自动签发缺省 true：打开 three_d_enabled 即开箱可用，无须手工收集
+	// ck_t_。显式 false 退回「只用手工凭证表」。
+	c.Features.ThreeDAutoToken = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	// 思考档位策略缺省：网关按模型最高档补缺档请求，但客户端显式档位优先
 	// （client_priority=true），且不覆盖客户端的关闭思考意图（override_scope=level）。
@@ -970,8 +1047,13 @@ func (c *Config) normalize() error {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
-		c.Logging.PanelLogEnabled = true
+	}
+	// 面板日志的回落与请求归档各管各的：request_archive_max_mb<=0 不能顺手把
+	// panel_log_enabled 的显式 false 改回 true（false 是合法取值，不回落）。
+	if c.Logging.PanelLogRetentionDays <= 0 {
 		c.Logging.PanelLogRetentionDays = 7
+	}
+	if c.Logging.PanelLogMaxMB <= 0 {
 		c.Logging.PanelLogMaxMB = 50
 	}
 	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
@@ -984,6 +1066,25 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 首帧心跳间隔：空回落 1.5s（等上游首帧期间补 SSE 注释帧，见 headkeepalive.go）；
+	// "0" 合法（关闭，回到零字节旧行为）；负值 fail fast。
+	if c.Server.HeadKeepalive == "" {
+		c.Server.HeadKeepalive = "1500ms"
+	}
+	if c.HeadKeepaliveDur, err = time.ParseDuration(c.Server.HeadKeepalive); err != nil {
+		return fmt.Errorf("server.head_keepalive: %q %w", c.Server.HeadKeepalive, err)
+	}
+	if c.HeadKeepaliveDur < 0 {
+		return fmt.Errorf("server.head_keepalive: 负时长 %q 无意义", c.Server.HeadKeepalive)
+	}
+	// 排队等待上限：0 回落缺省 60s；负数合法（= 不等，直接把排队交给客户端）；
+	// 超过 Retry-After 上报上限（600s）没有意义也无从验证，fail fast。
+	if c.Features.BusyWaitSeconds == 0 {
+		c.Features.BusyWaitSeconds = 60
+	}
+	if c.Features.BusyWaitSeconds > 600 {
+		return fmt.Errorf("features.busy_wait_seconds: %d 超出允许范围 1–600", c.Features.BusyWaitSeconds)
 	}
 	// 优雅关停窗口：空回落 30s（分钟级在途 SSE 远比旧固定 5s 常见）；"0" 合法
 	//（立即退）；负值 fail fast。
@@ -1057,6 +1158,20 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 账号目录热重载轮询（issue #199）。空值回落默认 10s；"0s" 是合法值（关闭），
+	// 负值钳 0 同关闭（"-5s" 无合理语义）。
+	if c.Accounts.ReloadInterval == "" {
+		c.Accounts.ReloadInterval = "10s"
+	}
+	if c.ReloadIntervalDur, err = time.ParseDuration(c.Accounts.ReloadInterval); err != nil {
+		return fmt.Errorf("accounts.reload_interval: %w", err)
+	}
+	if c.ReloadIntervalDur < 0 {
+		c.ReloadIntervalDur = 0
+	}
+	if c.Accounts.ReloadDeleteConfirm <= 0 {
+		c.Accounts.ReloadDeleteConfirm = 2
 	}
 	// 窗口用量调度窗口（issue #112）：空值回落默认 1h；"0" 合法（关停）；负值钳 0。
 	if c.Pool.BalanceWindow == "" {

@@ -226,6 +226,24 @@ func isPromptTooLongStatus(status int) bool {
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinMarkers = []string{"已签到", "already"}
 var badParamsMarkerCode = `"code":11101`
+var badParamsMarkerFuncParams = `invalid function call parameters`
+var badParamsMarkerFuncParamsAlt = `invalid_function_parameters`
+
+// badParamsMarkers11129 11129「invalid function call parameters」（displayMsg「工具定义不合规」）的文案
+// 形态，已小写化，与 strings.ToLower(body) 比对；中文原文无大小写，同样可比。业务码 11129 不在这里：
+// 走 hasBusinessCode（见 isToolSchemaRejected），容忍空白、字符串形态与嵌套。
+var badParamsMarkers11129 = []string{
+	badParamsMarkerFuncParams,
+	badParamsMarkerFuncParamsAlt,
+	"invalid_function_call_parameters",
+	"工具定义不合规",
+}
+
+// isToolSchemaRejected 判定 11129：业务码精确命中，或文案命中（首帧 error 帧里 message 可能是
+// 英文原文、下划线形态或中文 displayMsg）。lower 须为 strings.ToLower(body)。
+func isToolSchemaRejected(body, lower string) bool {
+	return hasBusinessCode(body, "11129") || containsAnyMarker(lower, badParamsMarkers11129)
+}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -504,6 +522,12 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
+// IsProviderOverloaded 报告 body 是否为 11134「模型供应商暂时不可用」。它与 6020/6021
+// 同归 ErrUpstreamBusy，但成因是供应商过载而不是排队：给客户端的文案要区分（队列满的
+// 措辞会让人去查排队），而且供应商过载时「换个模型」是有效出路，排队时不是。
+// 只认结构化 code，文案单独出现仍是普通 5xx。
+func IsProviderOverloaded(body string) bool { return hasBusinessCode(body, "11134") }
+
 // parseQueueRetryAfter 从排队/容量信封的 body 抽上游明示的重试等待时长。
 // 两种形态都认（整数秒，超 retryAfterSanity 按异常值封顶）：
 //
@@ -713,7 +737,7 @@ func Classify(status int, body string) ErrKind {
 	// vs 换号 0–12%）。
 	// 归 ErrUpstreamBusy = 不罚号 + body 侧解析 retry_policy.retry_after 后不轮转，
 	// 与 6020/6021 同一族（上游容量信号，自带重试口径）。
-	if hasBusinessCode(body, "11134") {
+	if IsProviderOverloaded(body) {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -823,7 +847,7 @@ func Classify(status int, body string) ErrKind {
 		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
 		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让
 		// （吸收上游 fd5c5a6）。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) || isToolSchemaRejected(body, lower) {
 			return ErrBadParams
 		}
 		return ErrClient
@@ -904,6 +928,13 @@ type Client struct {
 	// 供出站请求体补默认 max_tokens：上游对缺失限额的请求套保守默认（实测
 	// 32000），Codex 等不发限额的客户端写大文件会被无声截断。与 efforts 共用锁。
 	modelMaxOut map[string]map[string]int64
+	// exclusive 该域里「免费号调不通」的模型（modelTiers 的 accessMode=exclusive）。
+	// 与 modelRates 同口径：目录刷新即整体替换，共用锁。
+	exclusive map[string]map[string]bool
+	// paidByUID 各账号「是不是付费号」（billing summary 的 IsPaidUser）。只在拿到
+	// 该字段时写入（目前只有 global 的 summary 给）；缺条目 = 不知道。
+	paidMu    sync.RWMutex
+	paidByUID map[string]bool
 
 	// globalModels 缓存 global 模型目录探测结果（1h TTL + 5min 负缓存；
 	// 探测与合并见 global_models.go）。目录权威 = 桌面端 UA 族，见该文件注释。
@@ -935,7 +966,7 @@ type Client struct {
 	// 空 = 内置默认（对齐官方 5.5.4 分发包）。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（CN 包内置 CLI 2.176.0 / GL 2.165.0）。
 	CliVersion string
 
 	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
@@ -976,6 +1007,11 @@ type Client struct {
 	// modelBusyUnsupported 上游 /v2/chat/busy 在该域不存在（国际版实测 404）。探到一次即置位，
 	// 本进程后续跳过探测（见 modelbusy.go）。atomic：并发调用只读+一次性写。
 	modelBusyUnsupported atomic.Bool
+
+	// ThreeDCredential 混元 3D 的 `ck_t_` 临时云凭证来源（见 three_d_credential.go）。
+	// nil = 拿不到凭证 → 3D 一律回 503，不发请求。启动期挂载；凭证内容不进日志、
+	// 不进错误串、不落盘。
+	ThreeDCredential ThreeDCredential
 }
 
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
@@ -1791,7 +1827,10 @@ type ModelInfo struct {
 	// 「订阅优先」），空=不受限。只透文案不给布尔：海外是 Pro 专属（免费号调不通），
 	// 国内只是「优先调度」（能用，排队靠后），同一个 requiredUserType 两种语义，
 	// 一刀切成「不可用」会把国内这三个模型错标成禁选（issue #235）。
-	Tier              string
+	Tier string
+	// Exclusive accessMode=exclusive：免费号确实调不通（只有这一个字段能这么判，
+	// 文案不能）。选号据此跳过「已知免费」的号，见 pool 的 exclusiveModelOf。
+	Exclusive         bool
 	Vendor            string // vendor 厂商标识
 	IsDefault         bool   // isDefault 是否默认模型
 	SupportsReasoning bool   // supportsReasoning 是否支持推理
@@ -2267,7 +2306,11 @@ type v3ModelTier struct {
 	Enabled  bool     `json:"enabled"`
 	Priority int      `json:"priority"`
 	ModelIDs []string `json:"modelIds"`
-	Badge    *struct {
+	// AccessMode "exclusive" = 免费号根本调不通（海外 Pro Only 的机器可读口径）。
+	// CN 的「订阅优先」没有这个字段，只是排队靠后——把两者混成「不可用」会误拒
+	// 能用的请求（issue #235）。
+	AccessMode string `json:"accessMode"`
+	Badge      *struct {
 		Label string `json:"label"`
 	} `json:"badge"`
 }
@@ -2299,6 +2342,11 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 			}
 			best[id] = t.Priority
 			mi.Tier = t.Badge.Label
+			// exclusive 与文案无关：CN 那条「订阅优先」同样带 label 但没有 accessMode，
+			// 落到这里的只有海外 Pro Only 这种真门控。
+			if strings.EqualFold(strings.TrimSpace(t.AccessMode), "exclusive") {
+				mi.Exclusive = true
+			}
 			out[id] = mi
 		}
 	}
@@ -2306,6 +2354,7 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 	for _, id := range proOnlyFallback {
 		if mi, ok := out[id]; ok && mi.Tier == "" {
 			mi.Tier = "Pro Only"
+			mi.Exclusive = true // 实测免费号必 11158，与 accessMode=exclusive 同义
 			out[id] = mi
 		}
 	}
@@ -2417,9 +2466,13 @@ func effectiveModelRate(mi ModelInfo) string {
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
 func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
+	excl := make(map[string]bool)
 	for _, mi := range infos {
 		if mi.ID == "" {
 			continue
+		}
+		if mi.Exclusive {
+			excl[mi.ID] = true
 		}
 		if rate := effectiveModelRate(mi); rate != "" {
 			rates[mi.ID] = rate
@@ -2430,7 +2483,47 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	if c.modelRates == nil {
 		c.modelRates = make(map[string]map[string]string)
 	}
+	if c.exclusive == nil {
+		c.exclusive = make(map[string]map[string]bool)
+	}
 	c.modelRates[realmKey(realm)] = rates
+	c.exclusive[realmKey(realm)] = excl
+}
+
+// ModelExclusive 报告 (域, 模型) 是否「免费号调不通」（modelTiers accessMode=exclusive）。
+// 与 ModelRate 同口径：按 realm 分桶、目录刷新整体替换；未知一律 false（不拦）。
+func (c *Client) ModelExclusive(realm, model string) bool {
+	if c == nil || model == "" {
+		return false
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	return c.exclusive[realmKey(realm)][model]
+}
+
+// NotePaidUser 记录账号是不是付费号（billing summary 的 IsPaidUser）；只有拿到该字段
+// 时才调用，没调过 = 不知道（选号按「可用」处理，见 pool 的 exclusiveModelOf）。
+func (c *Client) NotePaidUser(uid string, paid bool) {
+	if c == nil || uid == "" {
+		return
+	}
+	c.paidMu.Lock()
+	defer c.paidMu.Unlock()
+	if c.paidByUID == nil {
+		c.paidByUID = make(map[string]bool)
+	}
+	c.paidByUID[uid] = paid
+}
+
+// PaidUser 返回记过的付费状态；第二个返回值为 false 表示没观测过（不是「免费」）。
+func (c *Client) PaidUser(uid string) (paid, known bool) {
+	if c == nil {
+		return false, false
+	}
+	c.paidMu.RLock()
+	defer c.paidMu.RUnlock()
+	paid, known = c.paidByUID[uid]
+	return paid, known
 }
 
 // storeModelMaxOut 按 realm 整体替换模型输出上限快照（maxOutputTokens）。
@@ -2450,6 +2543,16 @@ func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
 		c.modelMaxOut = make(map[string]map[string]int64)
 	}
 	c.modelMaxOut[realmKey(realm)] = m
+}
+
+// StoreModelMaxOutForTest 跨包测试钩子：直接写入某域的模型输出上限快照（真实路径由
+// FetchModels 刷新目录时写入）。仅测试引用。
+func (c *Client) StoreModelMaxOutForTest(realm string, maxOut map[string]int64) {
+	infos := make([]ModelInfo, 0, len(maxOut))
+	for id, n := range maxOut {
+		infos = append(infos, ModelInfo{ID: id, MaxTokens: n})
+	}
+	c.storeModelMaxOut(realm, infos)
 }
 
 // modelMaxOutSnapshot 返回输出上限快照副本；nil 表示未知（不补默认，行为同旧路径）。
@@ -2532,6 +2635,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
+	// X-Client-*：真机 /v3/config 3/3 条都带（含 CLI 两段式 UA 那条），
+	// 证明注入挂在共享 HTTP 层而非某个 RPC 模块上。按 realm 隔离注入。
+	c.injectClientIdentityHeaders(req, a)
 	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, nil, err
@@ -2798,13 +2904,26 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // deduction=2034-12-24，余额 500 分）。回退 ExpiredTime（仅在包失效后才回填）
 // → CycleEndTime。都缺 → 无到期（保守：不参与「先烧快到期的」排序）。
 func packageEndAt(deductionMS int64, expired, cycleEnd string) (time.Time, bool) {
+	t, _, ok := packageEndAtEx(deductionMS, expired, cycleEnd)
+	return t, ok
+}
+
+// packageEndAtEx 同 packageEndAt，另外回报「是否只能靠 CycleEndTime 推算」。
+//
+// fromCycle=true 表示前两个权威字段都没有，日期是按计量周期末日推的。上游 Bonus
+// Pack 的实测形态里 DeductionEndTime 与 CycleEndTime **完全相同**（2026-11-10 线上
+// 逐行核对，差 0 秒），所以正常情况不会走到这一步；但 CN 侧与历史包可能缺
+// DeductionEndTime，那时日期只是推算——调用方据此打 WARN 并在面板标注，别让运维
+// 把「推算值」当成真实扣费截止。
+func packageEndAtEx(deductionMS int64, expired, cycleEnd string) (time.Time, bool, bool) {
 	if deductionMS > 0 {
-		return time.UnixMilli(deductionMS).In(softRateResetLoc), true
+		return time.UnixMilli(deductionMS).In(softRateResetLoc), false, true
 	}
 	if t, ok := parsePackageEndTime(expired); ok {
-		return t, true
+		return t, false, true
 	}
-	return parsePackageEndTime(cycleEnd)
+	t, ok := parsePackageEndTime(cycleEnd)
+	return t, ok, ok
 }
 
 // ExpiryBucket 单个自然日到期的积分合计（按真实失效时刻 DeductionEndTime 聚合）。
@@ -2816,6 +2935,10 @@ type ExpiryBucket struct {
 	Date     string    `json:"date"`
 	ExpireAt time.Time `json:"expires_at,omitempty"`
 	Remain   int64     `json:"remain"`
+	// Estimated 该日额度里至少有一批的到期日是**按计量周期（CycleEndTime）推算**的，
+	// 不是上游给出的真实扣费截止（缺 DeductionEndTime / ExpiredTime 时的回退）。
+	// 面板据此标注「按计量周期推算」，避免运维把推算值当权威日期（issue #200）。
+	Estimated bool `json:"estimated,omitempty"`
 }
 
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
@@ -3158,11 +3281,11 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
+// 需要区分「本次真签到 / 今天早就签过」的调用方用 CheckinReceipt，本函数只保留
+// error 语义给不关心回执的老调用方（调度器 / CLI）。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-		return err
-	})
+	_, err := c.CheckinReceipt(a)
+	return err
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
@@ -3173,12 +3296,7 @@ func IsAlreadyCheckin(err error) bool {
 	if !errors.As(err, &ue) {
 		return false
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
-			return true
-		}
-	}
-	return false
+	return isAlreadyCheckinMsg(ue.Msg)
 }
 
 func truncate(s string, n int) string {
