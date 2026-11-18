@@ -11,9 +11,10 @@
 | 提交、开 PR、处理 issue | 「Git / GitHub 协作规则」 |
 | 改 AutoBot 流水线 | 「AutoBot 协作规则」及 `AutoBot.yml` / `.github/workflows/autobot.yml` |
 | 发版本 | 「版本发布」（时间标签，禁打 v1.x） |
+| 改冷却 / 熔断 / 封禁判据 | 「账号风控语义」+ `internal/pool/transition.go`（状态机唯一权威） |
 | 查历史缺陷教训 | 「踩过的坑」按编号/函数/错误文本检索，编号不因整理重排 |
 
-> **当前基线**：Go 1.26.10，全部包跑 `go build ./...` + `go test ./...`（254 个 `*_test.go` 遍布 cmd 与 internal 各包）。执行事实以当前代码为准；历史记录用于追溯，不用旧结果替代本轮验收。
+> **当前基线**：Go 1.26.10，全部包跑 `go build ./...` + `go test ./...`（421 个 `*_test.go` 遍布 cmd 与 internal 各包）。执行事实以当前代码为准；历史记录用于追溯，不用旧结果替代本轮验收。
 
 ## 上游边界（红线）
 
@@ -30,11 +31,11 @@
 
 ### 核心包（internal/）
 
-- `internal/server` — HTTP 服务与路由（OpenAI / Anthropic 兼容端点）
-- `internal/upstream` — 上游 API 适配、连接复用、TLS 指纹（`testdata/` 有钉行为的测试）
-- `internal/pool` — 账号池轮转、熔断与冷却、会话粘性。`SetBreaker(threshold, cooldown, cooldownMax)` 注入熔断参数（非正值保留默认）；`model_cooldowns` 持久化到 `state.json` 跨重启
-- `internal/panel` — Web 管理面板（账号、配置、签到/成长任务入口、锁池表与降级标注）
-- `internal/scheduler` — 定时签到 / 活跃 / 旅行 / 保活
+- `internal/server` — HTTP 服务与路由（OpenAI / Anthropic 兼容端点）。含 MCP 端点 `mcp.go`（`POST /mcp`，JSON-RPC 2.0 纯 POST，工具复用网关自己的 handler）、3D 端点 `three_d.go`、风控连坐 `restrict.go`、首帧保活 `headkeepalive.go`
+- `internal/upstream` — 上游 API 适配、连接复用、TLS 指纹（`testdata/` 有钉行为的测试）。`three_d*.go`（3D + TC3 签名与临时云凭证签发）、`campaign.go`（运营活动）、`sse_frame_split.go`（逐帧拆分）、`checkin_receipt.go`（签到回执）
+- `internal/pool` — 账号池轮转、熔断与冷却、会话粘性。`SetBreaker(threshold, cooldown, cooldownMax)` 注入熔断参数（非正值保留默认）；`model_cooldowns` 持久化到 `state.json` 跨重启。**`transition.go` 是账号状态机唯一权威（见「账号风控语义」）；`modelrules.go` 是模型规则（deny 优先于 allow 与自动冷却）**
+- `internal/panel` — Web 管理面板（账号、配置、签到/成长任务入口、锁池表与降级标注）。`reload.go`（账号目录热重载，七道护栏）、`tasklive.go`（实时任务卡）、`modelrules.go`、`campaign.go`、`app.js`（前端逻辑全在这里，Go 编译器不检查它）
+- `internal/scheduler` — 定时签到 / 活跃 / 旅行 / 保活。`checkin_retry.go`（补签退避）、`windowprobe.go`（额度窗口探针）
 - `internal/auth` / `internal/httpauth` — 鉴权（面板路由「默认拒绝」，见踩坑 4）
 - `internal/session` — 会话粘性路由：同一会话（conversationId / metadata 键）尽量绑定同一账号，支持从 Redis 恢复绑定（fast-path RLock / 双段分配 / TTL / 持久化）
 - `internal/livecfg` — 热配置
@@ -52,6 +53,10 @@
 - 根目录 `AutoBot.yml` — AutoBot 流水线配置（第 132 行起「硬禁项」段：给执行者的线，不是软约束）
 - `internal/upstream/testdata/` — 真实上游响应头样本（official_*_head.txt 等），钉解析行为的测试素材
 - `internal/scheduler/` — 定时任务核心：`growth.go`（成长任务，阶段 0 快照跳过已完成项）、`scheduler.go`（签到/保活调度）、`enterprise_gate_test.go`（企业版分支判据测试，判据同源的执行端）
+
+### 账号文件命名约定（热重载的硬前提）
+
+`internal/auth` 只认**文件名匹配 `workbuddy*.json`** 的账号文件（`auth.LoadDirReport` 里 `filepath.Match("workbuddy*.json", ...)`）。其余名字**会被静默忽略**：账号目录热重载会报告 `files:0` 并「成功」返回，看起来一切正常但一个号都没加载。外部脚本往 `auths/` 同步账号时必须遵守这个命名；排查「号导入后没进池」先看文件名。
 
 ## Git / GitHub 协作规则
 
@@ -94,6 +99,34 @@
 - 较大改动收官时说明：改了什么、原因、验证、未验证项、风险和回滚方式。
 - **任何「规则/要求」新增后，必须确认有代码消费它**：写进 `AutoBot.yml` 硬禁项、`AGENTS.md` 或 README 的约束如果没有执行端（CI 检查、代码断言、测试钉住），只是文档不是防线（同族：AutoBot 禁区扫描曾扫错段落、检查口径三方失配）。
 
+## 账号风控语义（冷却 / 熔断 / 降权 / 禁用四层）
+
+改任何「账号被罚多久 / 能不能自愈」的逻辑前先读这一节，权威实现是 `internal/pool/transition.go`（文件头有迁移矩阵，**禁止在其他文件散写 `disabled` / `until` / `modelCooldowns` / `breakerUntil` 四个字段**）。
+
+四个维度正交，按错误形态分派，**不是统一的「要么限时冷却要么永久封禁」**：
+
+| 维度 | 触发 | 时长 | 自愈 |
+|---|---|---|---|
+| 账号级冷却 `until/coolKind` | 429 / 404 / 余额耗尽 | 固定或指数退避，封顶 `soft_rate_max`（默认 2h） | ✅ 到期 |
+| 熔断 `breakerUntil` | 连续 5xx 达 `breaker_threshold`（默认 3） | 30min 起指数退避至 6h | ✅ 到期 + `NoteSuccess` |
+| 连败降权 `degradeUntil` | 「原因不明」失败连续 5 次 | 固定 10min | ✅ 到期 |
+| **禁用 `disabled`** | 见下 | **无限期** | ❌ **必须人工 revive** |
+
+**11140 一个 code 承载四类方向相反的错误，靠 code + 文案双判据区分（`internal/upstream/restrict.go`）**：
+
+- `request illegal` + code **11-128**（渠道校验）→ **软冷却**。请求级、可自愈，实测换模型换头不改结果、同号在别的客户端可用；禁用会误杀好号。
+- `request illegal` + code **11140**（auth_forbidden）→ **硬禁用** `Disable`。
+- 「账号存在异常行为，已被限制使用」/ `unusual activity` → **硬禁用** + 触发连坐保护。
+- 限流文案（含 6004 重置墙钟）→ 软冷却到重置时刻（截断到 2h 上限）。
+
+只按 code 判会把限流转成账号终态；只按「已被限制」这类泛化措辞判会把模型级限制误当设备级扫荡。**新增错误分支时必须确认 code 与文案两个条件都成立。**
+
+**风控连坐保护**（`internal/server/restrict.go`）：11140 判在上游的设备/出口上而不是单账号上，所以命中后**就地停手不换号**，并在同域窗口内多账号被限时暂停该域派发。阈值随池子规模缩放（`max(2, 本域可用号数/10)`），暂停从 30 秒起指数退避、封顶 `min(10min, upstream.restriction_hold_seconds)`，平静 30 分钟清零。**固定阈值 2 曾导致 340 个号的池上 0.6% 账号出事让 100% 请求失败（4,036 条 503），不要退回固定常量。**
+
+**自动 vs 人工恢复的边界**：冷却/熔断/降权靠到期；12153 会话失效需连续 3 次才禁用（中间任何一次 refresh 成功即 `ClearSessionDead` 清零，防误杀）；余额耗尽只解冻 `CoolHard` 到次日 04:00 等签到，**不碰**软限流与模型级冷却（余额恢复不是限流解除的证据）。`disabled` 只能 `POST /panel/api/accounts/{uid}/revive` 或重新登录。
+
+**封禁探活用 `POST /panel/api/accounts/{uid}/probe_ban`**（只读、不改池状态）：反复 revive 去试会立刻再撞 11140 加重判定，探活走最轻的余额查询端点。返回 200=已解封 / 11140=仍封 / 401=登录失效 / 其它=无结论。
+
 ## 面板与引擎判据同源
 
 本项目近期多次踩「判定逻辑两处各写一份、悄悄漂移」的坑，凡是「某账号该不该签到 / 某模型会不会降级 / 某路由要不要鉴权」这类判据：
@@ -127,7 +160,11 @@ AutoBot（`scripts/autobot.py` + `AutoBot.yml` + `.github/workflows/autobot.yml`
 
 ## 验证与验收
 
-- 改动后至少跑 `go build ./...`；有测试的包跑 `go test ./...`（254 个测试文件，别只跑自己改的那个包）。
+- 改动后至少跑 `go build ./...`；有测试的包跑 `go test ./...`（421 个测试文件，别只跑自己改的那个包）。
+- **本机（Windows / 开发机）没有 Go 工具链，也没有 node**：`go build` / `go test` 必须走 Docker（`golang:1.26` 镜像，实际 1.26.11 满足 `go 1.26.10`）。**不要**因为本机 `go: command not found` 就跳过编译与测试，也不要把「没跑」说成「跑过了」。
+- **用 Docker 跑测试必须装 node，否则前端测试会被静默跳过**：`internal/panel` 有 50 处 `exec.LookPath("node")` 兜底 `t.Skip`，`golang` 官方镜像里**没有 node**，所以裸跑 `go test ./...` 会输出 `ok ... 32s`（退出码 0）却跳过 **60 个测试**（48 个 `TestAppJS*` 前端渲染用例）。先 `apt-get install -y nodejs` 再跑，SKIP 数应降到 1（只剩需要旧版源码的 `TestUpgBinaryUpgradeSmoke`）。
+- **验证要在 Docker 里做、不要把测试脚本落到本机**：脚本走 stdin 传给容器（`docker run -i ... node - <<'EOF'`），源码目录用 `:ro` 只读挂载，产物留在容器 `/tmp`。Windows 下 Git Bash 会把容器内路径 `/src` 改写成 `C:/Program Files/Git/src`，**必须加 `MSYS_NO_PATHCONV=1`**。
+- **面板前端渲染不能靠 grep HTML 判断**：`app.js` 里的列表/表格是 JS 动态渲染，静态 HTML 里根本没有那些文本。要看渲染结果就真实执行 `app.js`（在容器里用 node + `vm` 切出目标函数跑），或起服务真正打开页面。
 - 面板行为改动要实际起服务、开页面做真实渲染冒烟；改判定函数必须对应改 UI 展示，两侧口径一致（见「面板与引擎判据同源」）。
 - 定时任务/签到类改动：核对「企业版 / API Key 账号不签到」之类账号类型分支。
 - 网络/代理层改动（`internal/upstream` / `internal/proxypool`）优先用真实连接写钉行为的测试（参考 `internal/upstream/testdata` 的做法：用真实 TLS 连接钉死 Connection 头不破坏连接复用）。
@@ -162,9 +199,9 @@ git push origin "v$VERSION"
 
 ## 踩过的坑（Bug 教训，勿重蹈）
 
-> 编号是历史交叉引用的稳定标识，不因整理而重排。新增教训从当前最大编号 +1 开始（当前下一条为 9）。按函数名、提交号或错误文本全文检索。
+> 编号是历史交叉引用的稳定标识，不因整理而重排。新增教训从当前最大编号 +1 开始（当前下一条为 11）。按函数名、提交号或错误文本全文检索。
 >
-> **分段索引**：1～3 判据同源 / 账号分支｜4～6 鉴权 / 兜底 / 幂等｜7 网络与代理｜8 AutoBot。
+> **分段索引**：1～3 判据同源 / 账号分支｜4～6 鉴权 / 兜底 / 幂等｜7 网络与代理｜8 AutoBot｜9～10 验收假绿（依赖缺失 / ok 不等于做成）。
 
 1. **签到判据两处漂移**（`f6c4a45`）：面板登录入口的签到判据没对齐 `SupportsPersonalGrowth`，同一账号「能不能签到」在 UI 显示和实际执行不一致。**凡「某账号该不该做某事」的判据，只许一份实现，UI 与引擎必须同源。**
 
@@ -181,6 +218,10 @@ git push origin "v$VERSION"
 7. **经代理的 HTTPS 丢指纹 / SOCKS 绕过代理直连**（PR #135~#137 / `673a446`、`f909de7`、`bbf2bb9`）：HTTP 代理下 TLS 指纹握手丢在隧道之前、SOCKS 场景绕过代理直连。已修为先建隧道再走指纹握手，并按域命中降级标注。**网络层修复用真实连接测试钉死行为（见「验证与验收」）。**
 
 8. **AutoBot 的假绿与误触发**（`41a2d39`、`d8cb1db`、`9a122b6`、`ac22925`、`edcfdf8`）：日志出现 429 就重放整轮、implement 零报告也报绿、靠 PR 标题正则认仓库失效、禁区扫描误扫对比表、patch 失败静默吞。**自动化流水线的成功判定要按「产物是否存在」而非日志关键词；识别信号用稳定字段；失败要显式，不静默。**
+
+9. **无 node 环境下前端测试静默跳过，验收报「全绿」其实是假的**（2026-11-18 合上游 177 个提交时踩到）：用 `golang:1.26` 镜像裸跑 `go test ./...`，输出 30 个包全 `ok`、退出码 0，但 `internal/panel` 里有 **60 个测试被 `t.Skip` 跳过**（其中 48 个是 `TestAppJS*` 系列，靠 `exec.LookPath("node")` 兜底）。装 node 后 SKIP 从 60 降到 1，`internal/panel` 耗时从 32.7s 涨到 38.7s——多出来的 6 秒才是真实执行 JS 的时间。**「测试全绿」必须同时看 SKIP 数，不能只看 ok/退出码；验收环境缺依赖时的 t.Skip 兜底会把「没跑」伪装成「通过」，与踩坑 8 的假绿同族。**
+
+10. **账号文件名不匹配 `workbuddy*.json` 时热重载静默不生效**（同上轮实测）：验证账号目录热重载（`accounts.reload_*`，issue #199）时用 `a.json` / `b.json` 造号，`POST /panel/api/accounts/reload` 每次都返回 `ok:true` 且 `skipped:false`，但 `files:0`、池子一个号都没加载——`auth.LoadDirReport` 里是 `filepath.Match("workbuddy*.json", ...)`，别的名字连候选都进不去。**「接口返回 ok」不等于「事情做成了」：判成功要看结果字段（`files` / `added` / `pool`），不看 `ok` 和 HTTP 200（同族踩坑 8 的假绿）。**
 
 ## 用户偏好
 
